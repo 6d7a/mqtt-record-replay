@@ -109,6 +109,7 @@ func readEntry(file *os.File) (MqttMessage, int64) {
 
 func (cl *Libp2pClient) Publish(message MqttMessage) error {
 	if  _, ok := cl.topics[message.Topic]; !ok {
+		fmt.Println("Adding new topic", message.Topic)
 		topic, err := cl.ps.Join(message.Topic)
 		if err != nil {
 			return err
@@ -327,10 +328,12 @@ func main() {
 
 	// Init libp2p client
 	println("Initializing libp2p client")
-	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0/ws"))
 	if err != nil {
 		panic(err)
 	}
+
+	fmt.Println("Listen addresses:", h.Addrs())
 
 	println("Starting Gossip PubSub")
 	ps, err := pubsub.NewGossipSub(ctx, h)
