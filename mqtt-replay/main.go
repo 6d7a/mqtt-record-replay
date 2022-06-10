@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -22,15 +23,23 @@ import (
 	"os/signal"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
 	msgpack "github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/term"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/peer"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 )
 
 const buildVersion string = "v2.0.0"
 
+const DiscoveryServiceTag = "gossip-mqtt-gateway"
+
 // configuration values
 const skipSeconds int = 5
+
 
 var verbosity int
 var brokerURL string
@@ -98,14 +107,43 @@ func readEntry(file *os.File) (MqttMessage, int64) {
 	return msg, payload_size
 }
 
-func publish(client mqtt.Client, msg MqttMessage) {
-	token := client.Publish(msg.Topic, byte(0), false, msg.Payload)
-	token.Wait()
+func (cl *Libp2pClient) Publish(message MqttMessage) error {
+	if  _, ok := cl.topics[message.Topic]; !ok {
+		topic, err := cl.ps.Join(message.Topic)
+		if err != nil {
+			return err
+		}
+		cl.topics[message.Topic] = topic
+	}
+	topic := cl.topics[message.Topic]
+	return topic.Publish(cl.ctx, message.Payload)
+}
+
+type Libp2pClient struct {
+	Messages chan *MqttMessage
+
+	ctx   context.Context
+	ps    *pubsub.PubSub
+	topics map[string]*pubsub.Topic
+
+	self     peer.ID
+}
+
+func JoinPubSub(ctx context.Context, ps *pubsub.PubSub, selfID peer.ID) (*Libp2pClient, error) {
+	client := &Libp2pClient{
+		ctx:      ctx,
+		ps:       ps,
+		topics:    make(map[string]*pubsub.Topic),
+		self:     selfID,
+		Messages: make(chan *MqttMessage, 128),
+	}
+
+	return client, nil
 }
 
 type Playback struct {
 	File   *os.File
-	Client mqtt.Client
+	Client *Libp2pClient
 
 	// internal playback state
 	endTimeAvailable   bool
@@ -153,7 +191,7 @@ func (p *Playback) PlayFrom(startTimeMillis uint) {
 			p.msgMillisRelative = msg.Millis - p.recordingStartTime
 			if p.msgMillisRelative >= int64(startTimeMillis) {
 				log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
-				publish(p.Client, msg)
+				p.Client.Publish(msg)
 
 				p.firstMsgMillis = msg.Millis
 				p.firstMsgWallclock = nowMillis()
@@ -204,7 +242,7 @@ func (p *Playback) PlayNextMessage() bool {
 	for {
 		if nowMillis() >= targetWallclock {
 			log.Printf("t=%6.2f s, %6d bytes, topic=%s\n", float32(p.msgMillisRelative)/1000.0, len, msg.Topic)
-			publish(p.Client, msg)
+			p.Client.Publish(msg)
 			break
 		}
 
@@ -263,6 +301,8 @@ func readKeypress() (string, error) {
 }
 
 func main() {
+	ctx := context.Background()
+
 	fmt.Println("MQTT Recording Replay " + buildVersion)
 	fmt.Println("- MQTT broker:     ", brokerURL)
 	fmt.Println("- Input filename:  ", filename)
@@ -285,17 +325,22 @@ func main() {
 	}
 	defer file.Close()
 
-	// try connecting to MQTT broker
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(brokerURL)
-
-	client := mqtt.NewClient(opts)
-	defer client.Disconnect(100)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		log.Panicln("Error connecting to MQTT broker:", token.Error())
+	// Init libp2p client
+	println("Initializing libp2p client")
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	if err != nil {
+		panic(err)
 	}
-	if verbosity > 1 {
-		log.Println("Success connecting to MQTT broker")
+
+	println("Starting Gossip PubSub")
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		panic(err)
+	}
+
+	println("Setting up discovery")
+	if err := setupDiscovery(h); err != nil {
+		panic(err)
 	}
 
 	// capture some signals
@@ -318,7 +363,10 @@ func main() {
 	//
 	var playControl Playback
 	playControl.File = file
-	playControl.Client = client
+	playControl.Client, err = JoinPubSub(ctx, ps, h.ID())
+	if err != nil {
+		panic(err)
+	}
 
 	playControl.Init(endTimeSec)
 	playControl.PlayFrom(startTimeSec * 1000)
@@ -371,4 +419,21 @@ func main() {
 	}
 
 	log.Println("Replay finished")
+}
+
+type discoveryNotifee struct {
+	h host.Host
+}
+
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	fmt.Printf("discovered new peer %s\n", pi.ID.Pretty())
+	err := n.h.Connect(context.Background(), pi)
+	if err != nil {
+		fmt.Printf("error connecting to peer %s: %s\n", pi.ID.Pretty(), err)
+	}
+}
+
+func setupDiscovery(h host.Host) error {
+	s := mdns.NewMdnsService(h, DiscoveryServiceTag, &discoveryNotifee{h: h})
+	return s.Start()
 }
